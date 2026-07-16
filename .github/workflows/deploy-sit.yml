@@ -13,13 +13,25 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install Salesforce CLI
-        uses: salesforcecli/github-action@v2
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
-      - name: Authenticate to SIT
+      - name: Install Salesforce CLI
+        run: |
+          npm install --global @salesforce/cli
+          sf --version
+
+      - name: Authenticate to Salesforce
         run: |
           echo "${{ secrets.SFDX_AUTH_URL_SIT }}" > auth.txt
-          sf org login sfdx-url --sfdx-url-file auth.txt --alias SIT
+          sf org login sfdx-url \
+            --sfdx-url-file auth.txt \
+            --alias SIT
 
-      - name: Deploy to SIT
-        run: sf project deploy start --source-dir force-app --target-org SIT
+      - name: Deploy Metadata
+        run: |
+          sf project deploy start \
+            --source-dir force-app \
+            --target-org SIT

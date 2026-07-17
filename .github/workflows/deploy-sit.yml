@@ -1,4 +1,4 @@
-name: Deploy to DEV
+name: Deploy to SIT
 
 on:
   push:
@@ -27,13 +27,13 @@ jobs:
         run: |
           echo "${{ secrets.SF_JWT_KEY }}" > server.key
           sf org login jwt \
-            --client-id ${{ secrets.SF_CONSUMER_KEY }} \
+            --client-id ${{ secrets.SF_CONSUMER_KEY_SIT }} \
             --jwt-key-file server.key \
-            --username ${{ secrets.SF_USERNAME }} \
-            --alias DEV
+            --username ${{ secrets.SF_USERNAME_SIT }} \
+            --alias SIT
 
-      - name: Deploy Metadata
+      - name: Deploy Metadata to SIT
         run: |
           sf project deploy start \
             --source-dir force-app \
-            --target-org DEV
+            --target-org SIT

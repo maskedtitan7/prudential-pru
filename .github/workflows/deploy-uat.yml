@@ -1,4 +1,4 @@
-name: Deploy to SIT
+name: Deploy to UAT
 
 on:
   workflow_dispatch:
@@ -25,13 +25,13 @@ jobs:
         run: |
           echo "${{ secrets.SF_JWT_KEY }}" > server.key
           sf org login jwt \
-            --client-id ${{ secrets.SF_CONSUMER_KEY_SIT }} \
+            --client-id ${{ secrets.SF_CONSUMER_KEY_UAT }} \
             --jwt-key-file server.key \
-            --username ${{ secrets.SF_USERNAME_SIT }} \
-            --alias SIT
+            --username ${{ secrets.SF_USERNAME_UAT }} \
+            --alias UAT
 
-      - name: Deploy Metadata to SIT
+      - name: Deploy Metadata to UAT
         run: |
           sf project deploy start \
             --source-dir force-app \
-            --target-org SIT
+            --target-org UAT

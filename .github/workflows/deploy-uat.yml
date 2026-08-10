@@ -5,6 +5,7 @@ on:
 
 jobs:
   deploy:
+    environment: UAT
     runs-on: ubuntu-latest
 
     steps:

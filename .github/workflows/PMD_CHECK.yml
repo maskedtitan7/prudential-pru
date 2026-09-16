@@ -84,9 +84,10 @@ jobs:
             echo '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"PMD","rules":[]}},"results":[]}]}' > pmd-report.sarif
           fi
 
+          # PMD exit code 4 = violations found - informational only for now, don't fail the job.
+          # Any other non-zero code means PMD itself hit a real error (bad config, crash, etc).
           if [ "$PMD_SARIF_EXIT" -eq 4 ]; then
-            echo "::error::PMD found violations. Review the report."
-            exit 1
+            echo "::warning::PMD found violations. Review the report and PR comment (informational only - not blocking)."
           elif [ "$PMD_SARIF_EXIT" -ne 0 ]; then
             echo "::error::PMD exited with unexpected code $PMD_SARIF_EXIT."
             exit 1

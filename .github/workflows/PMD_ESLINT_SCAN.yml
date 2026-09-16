@@ -1,0 +1,167 @@
+name: PMD & ESLint Full Scan
+
+# --------------------------------------------------------------------------
+# Personal-project version of the work PMD_ESLINT_SCAN.yml.
+# Runs a full PMD + ESLint static analysis scan over the entire force-app,
+# rather than just the delta - a periodic/manual safety net alongside the
+# delta-based PMD_CHECKS.yml.
+#
+# - workflow_dispatch: pick any single branch on demand.
+# - schedule: runs weekly against main (adjust/remove as you like).
+#
+# No org/sandbox authentication happens here - PMD and ESLint are pure
+# static analysis over local source files.
+# --------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to run PMD & ESLint scan against"
+        required: true
+        type: string
+        default: "main"
+
+  schedule:
+    # 9 AM SGT, Mondays = 01:00 UTC
+    - cron: "0 1 * * 1"
+
+jobs:
+  pmd-eslint-full-scan:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJson( github.event_name == 'schedule' && '["main"]' || format('["{0}"]', inputs.branch) ) }}
+
+    steps:
+      - name: Display Run Info
+        run: |
+          echo "Branch  : ${{ matrix.branch }}"
+          echo "Trigger : ${{ github.event_name }}"
+
+      - name: Checkout Salesforce Repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 1
+
+      - name: Resolve Branch Slug
+        id: meta
+        run: |
+          SLUG=$(echo "${{ matrix.branch }}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+
+      - name: Environment Sanity Check
+        run: node -v
+
+      # ----------------------------------------------------------------------
+      # PMD (full force-app, built-in Apex rulesets)
+      # ----------------------------------------------------------------------
+      - name: Download PMD
+        run: |
+          PMD_VERSION="7.1.0"
+          curl -sSL "https://github.com/pmd/pmd/releases/download/pmd_releases%2F${PMD_VERSION}/pmd-dist-${PMD_VERSION}-bin.zip" -o pmd.zip
+          unzip -q pmd.zip
+          echo "PMD_HOME=$(pwd)/pmd-bin-${PMD_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Run PMD Scan (Full force-app)
+        id: pmd
+        continue-on-error: true
+        run: |
+          "$PMD_HOME/bin/pmd" check \
+            --dir "./force-app" \
+            --rulesets category/apex/bestpractices.xml,category/apex/security.xml,category/apex/errorprone.xml \
+            --format csv \
+            --report-file pmd-full-report.csv \
+            --minimum-priority 3 \
+            --no-progress
+          echo "outcome=$([ $? -eq 0 ] && echo success || echo failure)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload PMD Full Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodeScanReport_PMD_Full-${{ steps.meta.outputs.slug }}
+          path: pmd-full-report.csv
+          if-no-files-found: ignore
+
+      # ----------------------------------------------------------------------
+      # ESLint (full force-app LWC JS)
+      # ----------------------------------------------------------------------
+      - name: Run ESLint Scan (Full force-app)
+        id: eslint
+        continue-on-error: true
+        run: |
+          echo "Executing ESLint scan on full force-app..."
+          npm install
+          npx eslint "./force-app/**/*.js" \
+            --no-error-on-unmatched-pattern \
+            --format json \
+            --output-file eslint-full-report.json
+          echo "outcome=$([ $? -eq 0 ] && echo success || echo failure)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload ESLint Full Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodeScanReport_ESLint_Full-${{ steps.meta.outputs.slug }}
+          path: eslint-full-report.json
+          if-no-files-found: ignore
+
+      # ----------------------------------------------------------------------
+      # Scan Summary
+      # ----------------------------------------------------------------------
+      - name: Scan Summary
+        if: always()
+        run: |
+          BRANCH="${{ matrix.branch }}" node -e '
+            const fs = require("fs");
+            const branch = process.env.BRANCH;
+
+            function countPmdCsv(path) {
+              if (!fs.existsSync(path)) return null;
+              const content = fs.readFileSync(path, "utf8");
+              const lines = content.split("\n").filter(l => l.trim().length > 0);
+              return Math.max(0, lines.length - 1);
+            }
+
+            function countEslintJson(path) {
+              if (!fs.existsSync(path)) return null;
+              try {
+                const results = JSON.parse(fs.readFileSync(path, "utf8"));
+                return results.reduce((sum, f) => sum + (f.messages ? f.messages.length : 0), 0);
+              } catch {
+                return null;
+              }
+            }
+
+            const pmdCount = countPmdCsv("pmd-full-report.csv");
+            const eslintCount = countEslintJson("eslint-full-report.json");
+
+            const lines = [
+              `## PMD & ESLint Full Scan - ${branch}`,
+              "",
+              pmdCount === null
+                ? "- PMD: report not generated"
+                : `- PMD: **${pmdCount}** violation(s) (see \`CodeScanReport_PMD_Full\` artifact)`,
+              eslintCount === null
+                ? "- ESLint: report not generated"
+                : `- ESLint: **${eslintCount}** violation(s) (see \`CodeScanReport_ESLint_Full\` artifact)`,
+            ];
+
+            const summaryFile = process.env.GITHUB_STEP_SUMMARY;
+            if (summaryFile) fs.appendFileSync(summaryFile, lines.join("\n") + "\n\n");
+            console.log(lines.join("\n"));
+          '
+
+      - name: Fail Job If Violations Found
+        if: always()
+        run: |
+          if [ "${{ steps.pmd.outputs.outcome }}" = "failure" ] || [ "${{ steps.eslint.outputs.outcome }}" = "failure" ]; then
+            echo "::error::Violations found by PMD and/or ESLint on branch ${{ matrix.branch }}. Check the uploaded CSV/JSON artifacts and job summary for details."
+            exit 1
+          fi
+          echo "No violations found."

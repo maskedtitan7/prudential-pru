@@ -20,7 +20,7 @@ on:
         options:
           - DEV
           - SIT
-          - QA
+          - UAT
           - PROD
           - ALL
         default: DEV
@@ -41,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        org: ${{ fromJson( github.event_name == 'schedule' && '["DEV","SIT"]' || (inputs.target_org == 'ALL' && '["DEV","SIT","QA","PROD"]' || format('["{0}"]', inputs.target_org)) ) }}
+        org: ${{ fromJson( github.event_name == 'schedule' && '["DEV","SIT"]' || (inputs.target_org == 'ALL' && '["DEV","SIT","UAT","PROD"]' || format('["{0}"]', inputs.target_org)) ) }}
 
     steps:
       - name: Display Run Info
@@ -80,8 +80,8 @@ jobs:
             SIT)
               AUTH_SECRET="SF_AUTH_URL_SIT"
               ;;
-            QA)
-              AUTH_SECRET="SF_AUTH_URL_QA"
+            UAT)
+              AUTH_SECRET="SF_AUTH_URL_UAT"
               ;;
             PROD)
               AUTH_SECRET="SF_AUTH_URL_PROD"
@@ -108,8 +108,8 @@ jobs:
             SF_AUTH_URL_SIT)
               AUTH_VALUE="${{ secrets.SF_AUTH_URL_SIT }}"
               ;;
-            SF_AUTH_URL_QA)
-              AUTH_VALUE="${{ secrets.SF_AUTH_URL_QA }}"
+            SF_AUTH_URL_UAT)
+              AUTH_VALUE="${{ secrets.SF_AUTH_URL_UAT }}"
               ;;
             SF_AUTH_URL_PROD)
               AUTH_VALUE="${{ secrets.SF_AUTH_URL_PROD }}"

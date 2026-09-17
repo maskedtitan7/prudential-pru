@@ -25,7 +25,7 @@ on:
         options:
           - DEV
           - SIT
-          - QA
+          - UAT
           - PROD
 
       deploy_mode:
@@ -123,8 +123,8 @@ jobs:
             SIT)
               AUTH_SECRET="SF_AUTH_URL_SIT"
               ;;
-            QA)
-              AUTH_SECRET="SF_AUTH_URL_QA"
+            UAT)
+              AUTH_SECRET="SF_AUTH_URL_UAT"
               ;;
             PROD)
               AUTH_SECRET="SF_AUTH_URL_PROD"
@@ -234,8 +234,8 @@ jobs:
             SF_AUTH_URL_SIT)
               AUTH_VALUE="${{ secrets.SF_AUTH_URL_SIT }}"
               ;;
-            SF_AUTH_URL_QA)
-              AUTH_VALUE="${{ secrets.SF_AUTH_URL_QA }}"
+            SF_AUTH_URL_UAT)
+              AUTH_VALUE="${{ secrets.SF_AUTH_URL_UAT }}"
               ;;
             SF_AUTH_URL_PROD)
               AUTH_VALUE="${{ secrets.SF_AUTH_URL_PROD }}"

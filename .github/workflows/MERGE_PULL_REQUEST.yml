@@ -1,42 +1,42 @@
-name: Validate Pull Request (Track -> SIT/QA)
+name: Deploy on Merge
 
 # --------------------------------------------------------------------------
-# Personal-project version of the work VALIDATE_PULL_REQUEST.yml.
-# Track -> SIT / QA validation: SGD, PMD, ESLint, authenticate, dry-run
-# deploy (never a real deploy - this workflow only ever validates).
+# Personal-project version of the work MERGE_PULL_REQUEST.yml.
 #
-# NOTE: triggers on PRs targeting branches named "sit" and "qa". Rename the
-# branches list below if your personal repo uses different names.
+# Runs AFTER a PR has been merged into sit or qa - i.e. the actual deploy
+# step that follows VALIDATE_PULL_REQUEST.yml's dry-run validation.
+#
+# Flow: PR opened into sit/qa -> VALIDATE_PULL_REQUEST.yml dry-run validates
+#       PR approved + merged -> THIS workflow fires on push -> real deploy
+#
+# NOTE: this diffs HEAD^ (the commit before the merge) against HEAD, so it
+# only picks up exactly what the merge introduced. This works cleanly if
+# you use "Squash and merge" on your PRs (recommended - keeps one commit
+# per PR on sit/qa). If you use a regular merge commit or "Rebase and
+# merge" instead, this delta range may not capture exactly what you expect -
+# ask me to adjust it if you pick a different merge strategy.
 # --------------------------------------------------------------------------
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  push:
     branches:
       - sit
       - uat
       - prod
+
     paths:
       - "force-app/**"
 
 jobs:
-  validate-pull-request:
-    timeout-minutes: 60
+  deploy:
+    timeout-minutes: 90
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
 
     steps:
-      - name: Display PR Info
-        run: |
-          echo "Source Branch: ${{ github.head_ref }}"
-          echo "Target Branch: ${{ github.base_ref }}"
-
-      - name: Checkout Salesforce Repo
+      - name: Checkout Target Branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref }}
+          ref: ${{ github.ref_name }}
           fetch-depth: 0
 
       - name: Install Salesforce CLI + sfdx-git-delta
@@ -53,28 +53,26 @@ jobs:
       - name: Fix Git Safe Directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Fetch Target Branch
-        run: git fetch origin "${{ github.base_ref }}"
-
-      - name: Compute Merge Base
-        id: mergebase
-        run: |
-          MERGE_BASE=$(git merge-base HEAD "origin/${{ github.base_ref }}")
-          echo "merge_base=$MERGE_BASE" >> "$GITHUB_OUTPUT"
-
       # ----------------------------------------------------------------------
-      # SGD Delta
+      # SGD Delta (just what this merge introduced)
       # ----------------------------------------------------------------------
       - name: Generate Delta Package
         run: |
           mkdir force-app-delta
           sf sgd source delta \
             --to HEAD \
-            --from "${{ steps.mergebase.outputs.merge_base }}" \
+            --from HEAD^ \
             --output-dir force-app-delta \
             --source-dir force-app \
             --api-version 66.0 \
             --generate-delta
+
+      - name: Print Commit SHA Used In Delta
+        run: |
+          echo "================ COMMIT SHA (DELTA RANGE) ================"
+          echo "From (HEAD^): $(git rev-parse HEAD^)"
+          echo "To   (HEAD) : $(git rev-parse HEAD)"
+          echo "============================================================"
 
       - name: Show Delta Structure
         run: ls -R force-app-delta || echo "No delta generated"
@@ -103,7 +101,7 @@ jobs:
       - name: Resolve Environment Mapping
         id: resolve_env
         run: |
-          case "${{ github.base_ref }}" in
+          case "${{ github.ref_name }}" in
             sit)
               ENV_NAME="SIT"
               AUTH_SECRET="SF_AUTH_URL_SIT"
@@ -113,7 +111,7 @@ jobs:
               AUTH_SECRET="SF_AUTH_URL_UAT"
               ;;
             *)
-              echo "::error::Branch '${{ github.base_ref }}' not supported. Exiting."
+              echo "::error::Branch '${{ github.ref_name }}' not supported. Exiting."
               exit 1
               ;;
           esac
@@ -124,62 +122,7 @@ jobs:
           echo "auth_secret=$AUTH_SECRET" >> "$GITHUB_OUTPUT"
 
       # ----------------------------------------------------------------------
-      # PMD + ESLint on Delta
-      # ----------------------------------------------------------------------
-      - name: Download PMD
-        run: |
-          PMD_VERSION="7.1.0"
-          curl -sSL "https://github.com/pmd/pmd/releases/download/pmd_releases%2F${PMD_VERSION}/pmd-dist-${PMD_VERSION}-bin.zip" -o pmd.zip
-          unzip -q pmd.zip
-          echo "PMD_HOME=$(pwd)/pmd-bin-${PMD_VERSION}" >> "$GITHUB_ENV"
-
-      - name: Run PMD Scan on Delta
-        continue-on-error: true
-        run: |
-          if [ -d "./force-app-delta/force-app" ]; then
-            "$PMD_HOME/bin/pmd" check \
-              --dir "./force-app-delta/force-app" \
-              --rulesets category/apex/bestpractices.xml,category/apex/security.xml,category/apex/errorprone.xml \
-              --format csv \
-              --report-file pmd-delta-report.csv \
-              --minimum-priority 3 \
-              --no-progress
-          else
-            echo "No delta folder, skipping PMD"
-          fi
-
-      - name: Upload PMD Delta Report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: PMD-Delta-Report-${{ steps.resolve_env.outputs.env_name }}
-          path: pmd-delta-report.csv
-          if-no-files-found: ignore
-
-      - name: Run LWC ESLint Scan (Delta Only)
-        id: eslint
-        continue-on-error: true
-        run: |
-          if [ ! -d "force-app-delta/force-app" ]; then
-            echo "No delta folder found. Skipping ESLint scan."
-            exit 0
-          fi
-          npm install
-          npx eslint "./force-app-delta/force-app/**/*.js" \
-            --no-error-on-unmatched-pattern \
-            --format json \
-            --output-file eslint-report.json || true
-
-      - name: Upload ESLint Report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ESLint-Delta-Report-${{ steps.resolve_env.outputs.env_name }}
-          path: eslint-report.json
-          if-no-files-found: ignore
-
-      # ----------------------------------------------------------------------
-      # Authenticate to Target Org (Dynamic Secret Selection)
+      # Authenticate to Target Org
       # ----------------------------------------------------------------------
       - name: Authenticate to Target Org
         run: |
@@ -209,44 +152,25 @@ jobs:
         run: sf org list
 
       # ----------------------------------------------------------------------
-      # Validate to Target Org (DRY-RUN ONLY)
+      # Deploy to Target Org (Actual - no --dry-run)
       # ----------------------------------------------------------------------
-      - name: Delta Validation to Target Org
+      - name: Deploy Delta to Target Org
         run: |
           if [ ! -f force-app-delta/package/package.xml ]; then
-            echo "No SF changes found. Validation skipped."
+            echo "No SF changes found. Deployment skipped."
             exit 0
           fi
 
           NUMBER_OF_COMPONENTS=$(grep -o "<members>" force-app-delta/package/package.xml | wc -l)
 
-          node -e '
-            const fs = require("fs");
-            const xml = fs.readFileSync("force-app-delta/package/package.xml", "utf8");
-            const isTestName = n => /Test/i.test(n) || /Tests?$/i.test(n);
-            const apexMembers = [];
-            for (const block of xml.matchAll(/<types>([\s\S]*?)<\/types>/g)) {
-              const typeName = (block[1].match(/<name>([^<]+)<\/name>/) || [])[1];
-              if (typeName === "ApexClass" || typeName === "ApexTrigger") {
-                for (const m of block[1].matchAll(/<members>([^<]+)<\/members>/g)) {
-                  apexMembers.push(m[1].trim());
-                }
-              }
-            }
-            fs.writeFileSync("delta_tests.txt", apexMembers.filter(isTestName).sort().join("\n"));
-            fs.writeFileSync("changed_apex.txt", apexMembers.filter(n => !isTestName(n)).sort().join("\n"));
-          '
+          if [ "$(grep -Ec 'name>Apex(Class|Trigger)' force-app-delta/package/package.xml || true)" -lt 1 ]; then
+            echo "Deploying delta without running Apex tests ($NUMBER_OF_COMPONENTS components)"
 
-          mapfile -t DELTA_TESTS < <(sed '/^$/d' delta_tests.txt)
-          mapfile -t CHANGED_APEX < <(sed '/^$/d' changed_apex.txt)
-
-          if [ ${#DELTA_TESTS[@]} -eq 0 ] && [ ${#CHANGED_APEX[@]} -eq 0 ]; then
-            echo "Validating Delta and NOT running Apex tests ($NUMBER_OF_COMPONENTS components)"
             sf project deploy start \
               --ignore-warnings \
+              --ignore-conflicts \
               --manifest force-app-delta/package/package.xml \
               --test-level NoTestRun \
-              --dry-run \
               --target-org myOrg \
               --wait 100 \
               --api-version 66.0 \
@@ -255,55 +179,53 @@ jobs:
           else
             echo "Apex detected in delta."
 
-            CONVENTION_TESTS=()
-            MISSING_CLASSES=()
-            for cls in "${CHANGED_APEX[@]}"; do
-              [ -z "$cls" ] && continue
-              FOUND_FOR_CLASS=0
-              while IFS= read -r candidate; do
-                [ -z "$candidate" ] && continue
-                base="$(basename "$candidate" .cls)"
-                if [[ "$base" =~ ^[Tt]est ]] || [[ "$base" =~ [Tt]ests?$ ]]; then
-                  CONVENTION_TESTS+=("$base")
-                  FOUND_FOR_CLASS=1
-                fi
-              done < <(find force-app -type f -iname "*${cls}*.cls")
+            SPECIFIED_TESTS=$(find force-app-delta/force-app -type f \( -iname "*Test.cls" -o -iname "*test.cls" \) \
+              | sed 's#.*/##' \
+              | sed 's/\.cls$//' \
+              | tr '\n' ' ')
 
-              if [ "$FOUND_FOR_CLASS" -eq 0 ]; then
-                MISSING_CLASSES+=("$cls")
-              fi
-            done
-
-            mapfile -t TESTS < <(printf '%s\n' "${DELTA_TESTS[@]}" "${CONVENTION_TESTS[@]}" | sed '/^$/d' | sort -u)
-
-            if [ ${#MISSING_CLASSES[@]} -gt 0 ]; then
-              for missing in "${MISSING_CLASSES[@]}"; do
-                echo "::warning::  - $missing has no corresponding test class found (neither in the delta nor in force-app)"
-              done
-            fi
-
-            if [ ${#TESTS[@]} -eq 0 ]; then
-              echo "::error::No test classes found for any changed Apex Class/Trigger. Please add/commit respective Test Classes."
+            if [ -z "$SPECIFIED_TESTS" ]; then
+              echo "::error::You are committing Apex Classes or Triggers without including any test class."
               exit 1
             fi
 
-            echo "Test classes to run: ${TESTS[*]}"
-
-            TEST_FLAGS=()
-            for t in "${TESTS[@]}"; do
-              TEST_FLAGS+=(--tests "$t")
-            done
+            echo "Executing the following Test Classes: $SPECIFIED_TESTS"
 
             sf project deploy start \
               --ignore-warnings \
+              --ignore-conflicts \
               --manifest force-app-delta/package/package.xml \
               --test-level RunSpecifiedTests \
-              "${TEST_FLAGS[@]}" \
-              --dry-run \
+              $(for t in $SPECIFIED_TESTS; do echo --tests "$t"; done) \
               --target-org myOrg \
               --wait 100 \
               --api-version 66.0 \
               --json | tee deploy-result.json
+          fi
+
+      # ----------------------------------------------------------------------
+      # Destructive Changes Deployment (Non-blocking)
+      # ----------------------------------------------------------------------
+      - name: Deploy Destructive Changes (Non-blocking)
+        if: always()
+        continue-on-error: true
+        run: |
+          FILE="force-app-delta/destructiveChanges/destructiveChanges.xml"
+
+          if [ -f "$FILE" ] && grep -q "<types>" "$FILE"; then
+            echo "Destructive changes detected."
+            cat "$FILE"
+
+            sf project deploy start \
+              --ignore-warnings \
+              --manifest force-app-delta/package/package.xml \
+              --post-destructive-changes "$FILE" \
+              --test-level NoTestRun \
+              --target-org myOrg \
+              --wait 100 \
+              --api-version 66.0
+          else
+            echo "No destructive changes found."
           fi
 
       # ----------------------------------------------------------------------
@@ -324,7 +246,7 @@ jobs:
             const rt = (result.details && result.details.runTestResult) || result.runTestResult;
 
             if (!rt) {
-              console.log("No Apex tests were run as part of this validation.");
+              console.log("No Apex tests were run as part of this deployment.");
               process.exit(0);
             }
 
@@ -355,5 +277,5 @@ jobs:
             const overallCovered = totalLoc - totalNotCovered;
             const overallPct = totalLoc > 0 ? ((overallCovered / totalLoc) * 100).toFixed(1) + "%" : "n/a";
             console.log("");
-            console.log(`Overall coverage for validated classes: ${overallPct} (${overallCovered}/${totalLoc} lines)`);
+            console.log(`Overall coverage for deployed classes: ${overallPct} (${overallCovered}/${totalLoc} lines)`);
           '

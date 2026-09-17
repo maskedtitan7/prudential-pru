@@ -7,7 +7,7 @@ public with sharing class EmployeeTestHelper {
             emp.Department__c = 'IT';
             insert emp;
         } catch (Exception e) {
-            // intentionallyy empty - PMD's EmptyCatchBlock rule should flag this
+            // intentionallyy what needs to be empty - PMD's EmptyCatchBlock rule should flag this
         }
     }
 }

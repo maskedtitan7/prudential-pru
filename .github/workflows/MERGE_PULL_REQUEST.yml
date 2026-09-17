@@ -177,24 +177,74 @@ jobs:
           else
             echo "Apex detected in delta."
 
-            SPECIFIED_TESTS=$(find force-app-delta/force-app -type f \( -iname "*Test.cls" -o -iname "*test.cls" \) \
-              | sed 's#.*/##' \
-              | sed 's/\.cls$//' \
-              | tr '\n' ' ')
+            node -e '
+              const fs = require("fs");
+              const xml = fs.readFileSync("force-app-delta/package/package.xml", "utf8");
+              const isTestName = n => /Test/i.test(n) || /Tests?$/i.test(n);
+              const apexMembers = [];
+              for (const block of xml.matchAll(/<types>([\s\S]*?)<\/types>/g)) {
+                const typeName = (block[1].match(/<name>([^<]+)<\/name>/) || [])[1];
+                if (typeName === "ApexClass" || typeName === "ApexTrigger") {
+                  for (const m of block[1].matchAll(/<members>([^<]+)<\/members>/g)) {
+                    apexMembers.push(m[1].trim());
+                  }
+                }
+              }
+              fs.writeFileSync("delta_tests.txt", apexMembers.filter(isTestName).sort().join("\n"));
+              fs.writeFileSync("changed_apex.txt", apexMembers.filter(n => !isTestName(n)).sort().join("\n"));
+            '
 
-            if [ -z "$SPECIFIED_TESTS" ]; then
-              echo "::error::You are committing Apex Classes or Triggers without including any test class."
+            mapfile -t DELTA_TESTS < <(sed '/^$/d' delta_tests.txt)
+            mapfile -t CHANGED_APEX < <(sed '/^$/d' changed_apex.txt)
+
+            CONVENTION_TESTS=()
+            MISSING_CLASSES=()
+            for cls in "${CHANGED_APEX[@]}"; do
+              [ -z "$cls" ] && continue
+              FOUND_FOR_CLASS=0
+              while IFS= read -r candidate; do
+                [ -z "$candidate" ] && continue
+                base="$(basename "$candidate" .cls)"
+                if [[ "$base" =~ ^[Tt]est ]] || [[ "$base" =~ [Tt]ests?$ ]]; then
+                  CONVENTION_TESTS+=("$base")
+                  FOUND_FOR_CLASS=1
+                fi
+              # Search the FULL force-app tree, not just the delta - the
+              # matching test class may already exist in the org/repo and
+              # simply wasn't touched in this particular commit.
+              done < <(find force-app -type f -iname "*${cls}*.cls")
+
+              if [ "$FOUND_FOR_CLASS" -eq 0 ]; then
+                MISSING_CLASSES+=("$cls")
+              fi
+            done
+
+            mapfile -t TESTS < <(printf '%s\n' "${DELTA_TESTS[@]}" "${CONVENTION_TESTS[@]}" | sed '/^$/d' | sort -u)
+
+            if [ ${#MISSING_CLASSES[@]} -gt 0 ]; then
+              for missing in "${MISSING_CLASSES[@]}"; do
+                echo "::warning::  - $missing has no corresponding test class found (neither in the delta nor in force-app)"
+              done
+            fi
+
+            if [ ${#TESTS[@]} -eq 0 ]; then
+              echo "::error::No test classes found for any changed Apex Class/Trigger. Please add/commit respective Test Classes."
               exit 1
             fi
 
-            echo "Executing the following Test Classes: $SPECIFIED_TESTS"
+            echo "Test classes to run: ${TESTS[*]}"
+
+            TEST_FLAGS=()
+            for t in "${TESTS[@]}"; do
+              TEST_FLAGS+=(--tests "$t")
+            done
 
             sf project deploy start \
               --ignore-warnings \
               --ignore-conflicts \
               --manifest force-app-delta/package/package.xml \
               --test-level RunSpecifiedTests \
-              $(for t in $SPECIFIED_TESTS; do echo --tests "$t"; done) \
+              "${TEST_FLAGS[@]}" \
               --target-org myOrg \
               --wait 100 \
               --api-version 66.0 \

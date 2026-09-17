@@ -7,7 +7,11 @@ public with sharing class EmployeeTestHelper {
             emp.Department__c = 'Engineering';
             insert emp;
         } catch (Exception e) {
-            // intentionally empty - PMD's EmptyCatchBlock rule should flag this
+            // TEMPORARY: surface the real error instead of hiding it.
+            // Revert this to an empty catch block once the insert works,
+            // so PMD has something to flag again for testing purposes.
+            System.debug('EmployeeTestHelper insert failed: ' + e.getMessage());
+            throw e;
         }
     }
 }

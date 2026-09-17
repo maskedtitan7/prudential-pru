@@ -11,6 +11,8 @@ on:
     types: [opened, synchronize, reopened]
     branches:
       - main
+      - sit
+      - uat
     paths:
       - "force-app/**"
 

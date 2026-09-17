@@ -1,0 +1,364 @@
+name: Manual Deploy
+
+# --------------------------------------------------------------------------
+# Personal-project version of the work MANUAL_DEPLOY.yml.
+# Manual workflow_dispatch deploy/validate to a chosen org, either by
+# diffing two commit SHAs (delta-sha) or deploying an existing package.xml
+# already committed under manifest/ (package-xml).
+#
+# dry_run defaults to true - keep it that way until you've validated a
+# deploy a few times and are comfortable it's doing what you expect.
+# --------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "Branch to checkout and deploy from"
+        required: true
+        type: string
+
+      target_org:
+        description: "Target org to deploy to"
+        required: true
+        type: choice
+        options:
+          - DEV
+          - SIT
+          - QA
+          - PROD
+
+      deploy_mode:
+        description: "How to build the package: diff two SHAs, or deploy an existing package.xml from the branch"
+        required: true
+        type: choice
+        options:
+          - delta-sha
+          - package-xml
+
+      source_sha:
+        description: "[delta-sha mode] Commit SHA to diff FROM"
+        required: false
+        type: string
+
+      target_sha:
+        description: "[delta-sha mode] Commit SHA to diff TO (leave empty to use the tip of target_branch)"
+        required: false
+        type: string
+
+      package_xml_name:
+        description: "[package-xml mode] File name under manifest/ to deploy directly, e.g. package.xml"
+        required: false
+        type: string
+
+      test_level:
+        description: "Apex test level"
+        required: true
+        type: choice
+        options:
+          - NoTestRun
+          - RunSpecifiedTests
+          - RunLocalTests
+          - RunAllTestsInOrg
+        default: RunLocalTests
+
+      specified_tests:
+        description: "[only if test_level=RunSpecifiedTests] Comma-separated Apex test class names"
+        required: false
+        type: string
+
+      dry_run:
+        description: "Validate only (true) or actually deploy (false)"
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  manual-deploy:
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Display Run Info
+        run: |
+          echo "Target Branch : ${{ inputs.target_branch }}"
+          echo "Target Org    : ${{ inputs.target_org }}"
+          echo "Deploy Mode   : ${{ inputs.deploy_mode }}"
+          echo "Source SHA    : ${{ inputs.source_sha }}"
+          echo "Target SHA    : ${{ inputs.target_sha }}"
+          echo "Package XML   : ${{ inputs.package_xml_name }}"
+          echo "Test Level    : ${{ inputs.test_level }}"
+          echo "Dry Run       : ${{ inputs.dry_run }}"
+
+      - name: Checkout Target Branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 0
+
+      - name: Install Salesforce CLI + sfdx-git-delta
+        run: |
+          npm install --global @salesforce/cli@latest
+          sf plugins install sfdx-git-delta
+
+      - name: Environment Sanity Check
+        run: |
+          sf --version
+          sf plugins
+          node -v
+
+      - name: Fix Git Safe Directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # ----------------------------------------------------------------------
+      # Resolve Auth Secret From Selected Target Org
+      # ----------------------------------------------------------------------
+      - name: Resolve Environment Mapping
+        id: resolve_env
+        run: |
+          case "${{ inputs.target_org }}" in
+            DEV)
+              AUTH_SECRET="SF_AUTH_URL_DEV"
+              ;;
+            SIT)
+              AUTH_SECRET="SF_AUTH_URL_SIT"
+              ;;
+            QA)
+              AUTH_SECRET="SF_AUTH_URL_QA"
+              ;;
+            PROD)
+              AUTH_SECRET="SF_AUTH_URL_PROD"
+              ;;
+            *)
+              echo "::error::Target org not supported. Exiting."
+              exit 1
+              ;;
+          esac
+
+          echo "Resolved Environment: ${{ inputs.target_org }}"
+          echo "Using Auth Secret: $AUTH_SECRET"
+          echo "auth_secret=$AUTH_SECRET" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------------
+      # Mode: delta-sha -> Generate Delta Package From SHAs
+      # ----------------------------------------------------------------------
+      - name: Validate delta-sha Inputs
+        if: inputs.deploy_mode == 'delta-sha'
+        run: |
+          if [ -z "${{ inputs.source_sha }}" ]; then
+            echo "::error::source_sha is required when deploy_mode is delta-sha"
+            exit 1
+          fi
+
+      - name: Resolve Target SHA
+        if: inputs.deploy_mode == 'delta-sha'
+        id: resolve_sha
+        run: |
+          if [ -z "${{ inputs.target_sha }}" ]; then
+            TARGET_SHA=$(git rev-parse HEAD)
+          else
+            TARGET_SHA="${{ inputs.target_sha }}"
+          fi
+          echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+          echo "Resolved Target SHA: $TARGET_SHA"
+
+      - name: Generate Delta Package
+        if: inputs.deploy_mode == 'delta-sha'
+        run: |
+          mkdir force-app-delta
+          sf sgd source delta \
+            --to "${{ steps.resolve_sha.outputs.target_sha }}" \
+            --from "${{ inputs.source_sha }}" \
+            --output-dir force-app-delta \
+            --source-dir force-app \
+            --generate-delta
+
+      - name: Show Delta Structure
+        if: inputs.deploy_mode == 'delta-sha'
+        run: ls -R force-app-delta || echo "No delta generated"
+
+      - name: Print Generated package.xml
+        if: inputs.deploy_mode == 'delta-sha'
+        run: |
+          if [ -f force-app-delta/package/package.xml ]; then
+            echo "================ PACKAGE.XML ================"
+            cat force-app-delta/package/package.xml
+          else
+            echo "No package.xml generated"
+          fi
+
+      - name: Print Generated destructiveChanges.xml
+        if: inputs.deploy_mode == 'delta-sha'
+        run: |
+          if [ -f force-app-delta/destructiveChanges/destructiveChanges.xml ]; then
+            echo "========== DESTRUCTIVE CHANGES XML =========="
+            cat force-app-delta/destructiveChanges/destructiveChanges.xml
+          else
+            echo "No destructiveChanges.xml generated"
+          fi
+
+      # ----------------------------------------------------------------------
+      # Mode: package-xml -> Use Existing Manifest From Branch
+      # ----------------------------------------------------------------------
+      - name: Validate package-xml Inputs
+        if: inputs.deploy_mode == 'package-xml'
+        id: resolve_manifest
+        run: |
+          if [ -z "${{ inputs.package_xml_name }}" ]; then
+            echo "::error::package_xml_name is required when deploy_mode is package-xml"
+            exit 1
+          fi
+
+          MANIFEST_PATH="manifest/${{ inputs.package_xml_name }}"
+
+          if [ ! -f "$MANIFEST_PATH" ]; then
+            echo "::error::$MANIFEST_PATH not found on branch '${{ inputs.target_branch }}'"
+            exit 1
+          fi
+
+          echo "================ PACKAGE.XML ================"
+          cat "$MANIFEST_PATH"
+          echo "==============================================="
+
+          echo "manifest_path=$MANIFEST_PATH" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------------
+      # Authenticate to Target Org (Dynamic Secret Selection)
+      # ----------------------------------------------------------------------
+      - name: Authenticate to Target Org
+        run: |
+          case "${{ steps.resolve_env.outputs.auth_secret }}" in
+            SF_AUTH_URL_DEV)
+              AUTH_VALUE="${{ secrets.SF_AUTH_URL_DEV }}"
+              ;;
+            SF_AUTH_URL_SIT)
+              AUTH_VALUE="${{ secrets.SF_AUTH_URL_SIT }}"
+              ;;
+            SF_AUTH_URL_QA)
+              AUTH_VALUE="${{ secrets.SF_AUTH_URL_QA }}"
+              ;;
+            SF_AUTH_URL_PROD)
+              AUTH_VALUE="${{ secrets.SF_AUTH_URL_PROD }}"
+              ;;
+            *)
+              echo "::error::No matching auth secret found"
+              exit 1
+              ;;
+          esac
+
+          if [ -z "$AUTH_VALUE" ]; then
+            echo "::error::Auth secret is empty!"
+            exit 1
+          fi
+
+          echo "$AUTH_VALUE" > token.txt
+          sf auth sfdxurl store -f token.txt -a myOrg -s
+          rm token.txt
+
+      - name: Verify Auth
+        run: sf org list
+
+      # ----------------------------------------------------------------------
+      # Deploy / Validate to Target Org
+      # ----------------------------------------------------------------------
+      - name: Deploy or Validate to Target Org
+        run: |
+          if [ "${{ inputs.deploy_mode }}" = "package-xml" ]; then
+            MANIFEST="${{ steps.resolve_manifest.outputs.manifest_path }}"
+          else
+            MANIFEST="force-app-delta/package/package.xml"
+          fi
+
+          if [ ! -f "$MANIFEST" ] || [ "$(wc -l < "$MANIFEST")" -le 4 ]; then
+            echo "No SF changes found in $MANIFEST. Deployment skipped."
+            exit 0
+          fi
+
+          NUMBER_OF_COMPONENTS=$(grep -o "<members>" "$MANIFEST" | wc -l)
+          echo "Deploying $NUMBER_OF_COMPONENTS component(s) from $MANIFEST"
+
+          CONFLICT_FLAG=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            DRY_RUN_FLAG="--dry-run"
+          else
+            DRY_RUN_FLAG=""
+            CONFLICT_FLAG="--ignore-conflicts"
+          fi
+
+          TEST_LEVEL="${{ inputs.test_level }}"
+          TEST_FLAGS=(--test-level "$TEST_LEVEL")
+
+          if [ "$TEST_LEVEL" = "RunSpecifiedTests" ]; then
+            if [ -z "${{ inputs.specified_tests }}" ]; then
+              echo "::error::specified_tests is required when test_level is RunSpecifiedTests"
+              exit 1
+            fi
+            IFS=',' read -ra TESTS <<< "${{ inputs.specified_tests }}"
+            for t in "${TESTS[@]}"; do TEST_FLAGS+=(--tests "$t"); done
+          fi
+
+          set +e
+          sf project deploy start \
+            --ignore-warnings \
+            $CONFLICT_FLAG \
+            $DRY_RUN_FLAG \
+            --manifest "$MANIFEST" \
+            "${TEST_FLAGS[@]}" \
+            --target-org myOrg \
+            --wait 100 \
+            --json | tee deploy-result.json
+          DEPLOY_EXIT=${PIPESTATUS[0]}
+          set -e
+          exit $DEPLOY_EXIT
+
+      # ----------------------------------------------------------------------
+      # Apex Test Results & Coverage Summary
+      # ----------------------------------------------------------------------
+      - name: Apex Test Results & Coverage Summary
+        if: always()
+        run: |
+          if [ ! -f deploy-result.json ]; then
+            echo "No deploy-result.json found - no tests were run."
+            exit 0
+          fi
+
+          node -e '
+            const fs = require("fs");
+            const payload = JSON.parse(fs.readFileSync("deploy-result.json", "utf8"));
+            const result = payload.result || {};
+            const rt = (result.details && result.details.runTestResult) || result.runTestResult;
+
+            if (!rt) {
+              console.log("No Apex tests were run as part of this deployment.");
+              process.exit(0);
+            }
+
+            const successes = rt.successes || [];
+            const failures = rt.failures || [];
+            const coverage = (rt.codeCoverage || []).slice().sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+
+            console.log(`Tests run: ${rt.numTestsRun || successes.length + failures.length} | Failures: ${rt.numFailures || failures.length}`);
+            console.log("");
+            console.log("Class | Method | Result");
+            console.log("----- | ------ | ------");
+            for (const s of successes) console.log(`${s.name} | ${s.methodName} | PASS`);
+            for (const f of failures) console.log(`${f.name} | ${f.methodName} | FAIL - ${(f.message || "").replace(/\n/g, " ")}`);
+
+            console.log("");
+            console.log("Class | Covered | Total | Coverage %");
+            console.log("----- | ------- | ----- | ----------");
+            let totalLoc = 0, totalNotCovered = 0;
+            for (const c of coverage) {
+              const total = Number(c.numLocations || 0);
+              const notCovered = Number(c.numLocationsNotCovered || 0);
+              const covered = total - notCovered;
+              totalLoc += total;
+              totalNotCovered += notCovered;
+              const pct = total > 0 ? ((covered / total) * 100).toFixed(1) + "%" : "n/a";
+              console.log(`${c.name} | ${covered} | ${total} | ${pct}`);
+            }
+            const overallCovered = totalLoc - totalNotCovered;
+            const overallPct = totalLoc > 0 ? ((overallCovered / totalLoc) * 100).toFixed(1) + "%" : "n/a";
+            console.log("");
+            console.log(`Overall coverage for deployed classes: ${overallPct} (${overallCovered}/${totalLoc} lines)`);
+          '

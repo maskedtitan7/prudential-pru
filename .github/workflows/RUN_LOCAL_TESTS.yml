@@ -1,0 +1,266 @@
+name: Run Local Tests
+
+# --------------------------------------------------------------------------
+# Personal-project version of the work RUN_LOCAL_TESTS.yml.
+# Runs Apex RunLocalTests against one or more of your Developer Edition orgs.
+#
+# To add a new org later:
+#   1. Add it to the workflow_dispatch "target_org" choice list below.
+#   2. Add a case to both "Resolve Environment Mapping" and "Authenticate".
+#   3. (Optional) Add it to the schedule's org list if it should run nightly.
+# --------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_org:
+        description: "Org to run RunLocalTests against (ALL runs every org in the list)"
+        required: true
+        type: choice
+        options:
+          - DEV
+          - SIT
+          - QA
+          - PROD
+          - ALL
+        default: DEV
+      ref:
+        description: "Branch/tag/SHA to checkout (leave empty to use the branch this workflow runs on)"
+        required: false
+        type: string
+
+  schedule:
+    # 10 PM SGT daily = 14:00 UTC. Non-prod only (DEV, SIT) - QA/PROD are manual-only via workflow_dispatch.
+    - cron: "0 14 * * *"
+
+jobs:
+  run-local-tests:
+    timeout-minutes: 100
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        org: ${{ fromJson( github.event_name == 'schedule' && '["DEV","SIT"]' || (inputs.target_org == 'ALL' && '["DEV","SIT","QA","PROD"]' || format('["{0}"]', inputs.target_org)) ) }}
+
+    steps:
+      - name: Display Run Info
+        run: |
+          echo "Org     : ${{ matrix.org }}"
+          echo "Trigger : ${{ github.event_name }}"
+          echo "Ref     : ${{ inputs.ref || github.ref }}"
+
+      - name: Checkout Salesforce Repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli@latest
+
+      - name: Environment Sanity Check
+        run: |
+          sf --version
+          node -v
+
+      - name: Fix Git Safe Directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # ----------------------------------------------------------------------
+      # Resolve Auth Secret From Org Name
+      # ----------------------------------------------------------------------
+      - name: Resolve Environment Mapping
+        id: resolve_env
+        run: |
+          case "${{ matrix.org }}" in
+            DEV)
+              AUTH_SECRET="SF_AUTH_URL_DEV"
+              ;;
+            SIT)
+              AUTH_SECRET="SF_AUTH_URL_SIT"
+              ;;
+            QA)
+              AUTH_SECRET="SF_AUTH_URL_QA"
+              ;;
+            PROD)
+              AUTH_SECRET="SF_AUTH_URL_PROD"
+              ;;
+            *)
+              echo "::error::Org '${{ matrix.org }}' not supported. Exiting."
+              exit 1
+              ;;
+          esac
+
+          echo "Resolved Org: ${{ matrix.org }}"
+          echo "Using Auth Secret: $AUTH_SECRET"
+          echo "auth_secret=$AUTH_SECRET" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------------
+      # Authenticate to Target Org (Dynamic Secret Selection)
+      # ----------------------------------------------------------------------
+      - name: Authenticate to Target Org
+        run: |
+          case "${{ steps.resolve_env.outputs.auth_secret }}" in
+            SF_AUTH_URL_DEV)
+              AUTH_VALUE="${{ secrets.SF_AUTH_URL_DEV }}"
+              ;;
+            SF_AUTH_URL_SIT)
+              AUTH_VALUE="${{ secrets.SF_AUTH_URL_SIT }}"
+              ;;
+            SF_AUTH_URL_QA)
+              AUTH_VALUE="${{ secrets.SF_AUTH_URL_QA }}"
+              ;;
+            SF_AUTH_URL_PROD)
+              AUTH_VALUE="${{ secrets.SF_AUTH_URL_PROD }}"
+              ;;
+            *)
+              echo "::error::No matching auth secret found"
+              exit 1
+              ;;
+          esac
+
+          if [ -z "$AUTH_VALUE" ]; then
+            echo "::error::Auth secret is empty!"
+            exit 1
+          fi
+
+          echo "$AUTH_VALUE" > token.txt
+          sf auth sfdxurl store -f token.txt -a myOrg -s
+          rm token.txt
+
+      - name: Verify Auth
+        run: sf org list
+
+      - name: Compute Report Date
+        id: meta
+        run: echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------------
+      # Run Apex RunLocalTests
+      # ----------------------------------------------------------------------
+      - name: Run Apex Tests (RunLocalTests)
+        id: run_tests
+        continue-on-error: true
+        run: |
+          set +e
+          sf apex run test \
+            --target-org myOrg \
+            --test-level RunLocalTests \
+            --code-coverage \
+            --result-format json \
+            --wait 100 \
+            --json | tee raw-result.json
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+          echo "sf_exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------------
+      # Build CSV Reports + Readable Job Summary
+      # ----------------------------------------------------------------------
+      - name: Generate CSV Reports & Summary
+        if: always()
+        run: |
+          if [ ! -f raw-result.json ]; then
+            echo "::error::No raw-result.json found - Apex test run did not produce output."
+            exit 0
+          fi
+
+          mkdir -p reports
+          ORG_NAME="${{ matrix.org }}" REPORT_DATE="${{ steps.meta.outputs.date }}" node -e '
+            const fs = require("fs");
+            const orgName = process.env.ORG_NAME;
+            const reportDate = process.env.REPORT_DATE;
+            const base = `${orgName}-${reportDate}`;
+            const payload = JSON.parse(fs.readFileSync("raw-result.json", "utf8"));
+            const result = payload.result || {};
+            const tests = result.tests || [];
+            const coverage = (result.coverage && result.coverage.coverage) || [];
+
+            const failing = tests.filter(t => t.Outcome !== "Pass");
+            const passing = tests.filter(t => t.Outcome === "Pass");
+            const outcome = (result.summary && result.summary.outcome) || (failing.length > 0 ? "Failed" : "Passed");
+
+            function csvEscape(v) {
+              const s = (v === undefined || v === null) ? "" : String(v);
+              return /[",\n]/.test(s) ? `"${s.replace(/"/g, "\"\"")}"` : s;
+            }
+            function writeCsv(path, header, rows) {
+              const lines = [header.join(",")];
+              for (const row of rows) lines.push(row.map(csvEscape).join(","));
+              fs.writeFileSync(path, lines.join("\n") + "\n");
+            }
+
+            writeCsv(`reports/apex-test-results-${base}.csv`,
+              ["Class", "Method", "Outcome", "RunTime (ms)", "Error Message", "Stack Trace"],
+              tests.map(t => [
+                (t.ApexClass && t.ApexClass.Name) || "",
+                t.MethodName || "",
+                t.Outcome,
+                (t.RunTime !== null && t.RunTime !== undefined) ? t.RunTime : "",
+                t.Message || "",
+                t.StackTrace || "",
+              ])
+            );
+
+            const coverageSorted = coverage.slice().sort((a, b) => {
+              const pctA = a.totalLines > 0 ? a.totalCovered / a.totalLines : 1;
+              const pctB = b.totalLines > 0 ? b.totalCovered / b.totalLines : 1;
+              return pctA - pctB;
+            });
+            writeCsv(`reports/apex-code-coverage-${base}.csv`,
+              ["Class", "Covered Lines", "Total Lines", "Coverage %"],
+              coverageSorted.map(c => [
+                c.name || "",
+                (c.totalCovered != null) ? c.totalCovered : "",
+                (c.totalLines != null) ? c.totalLines : "",
+                c.totalLines > 0 ? ((c.totalCovered / c.totalLines) * 100).toFixed(1) : "n/a",
+              ])
+            );
+
+            console.log(`Result: ${outcome} | Ran: ${tests.length} | Pass: ${passing.length} | Fail: ${failing.length}`);
+            console.log("");
+            console.log("Class | Method | Outcome");
+            console.log("----- | ------ | -------");
+            for (const t of tests) console.log(`${(t.ApexClass && t.ApexClass.Name) || ""} | ${t.MethodName || ""} | ${t.Outcome}`);
+
+            const summaryFile = process.env.GITHUB_STEP_SUMMARY;
+            if (summaryFile) {
+              const md = [
+                `## Apex RunLocalTests - ${orgName} (${reportDate})`,
+                "",
+                `**Result:** ${outcome}`,
+                `**Tests Ran:** ${tests.length} | **Passing:** ${passing.length} | **Failing:** ${failing.length}`,
+              ];
+              if (failing.length > 0) {
+                md.push("", "| Class | Method | Message |", "| --- | --- | --- |");
+                for (const t of failing) {
+                  const msg = (t.Message || "").replace(/\|/g, "\\|").replace(/\n/g, " ");
+                  md.push(`| ${(t.ApexClass && t.ApexClass.Name) || ""} | ${t.MethodName || ""} | ${msg} |`);
+                }
+              }
+              fs.appendFileSync(summaryFile, md.join("\n") + "\n\n");
+            }
+          '
+
+      - name: Upload Test Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ApexTestReport-${{ matrix.org }}-${{ steps.meta.outputs.date }}
+          path: |
+            reports/apex-test-results-*.csv
+            reports/apex-code-coverage-*.csv
+          if-no-files-found: warn
+
+      # ----------------------------------------------------------------------
+      # Fail the job if the test run itself failed/errored
+      # (kept last so the report artifact above is always uploaded first)
+      # ----------------------------------------------------------------------
+      - name: Fail Job If Tests Failed
+        if: always()
+        run: |
+          if [ "${{ steps.run_tests.outputs.sf_exit_code }}" != "0" ]; then
+            echo "::error::RunLocalTests reported failures or an error for org ${{ matrix.org }} (exit code ${{ steps.run_tests.outputs.sf_exit_code }}). See the ApexTestReport-${{ matrix.org }}-${{ steps.meta.outputs.date }} artifact."
+            exit 1
+          fi

@@ -1,0 +1,156 @@
+name: PMD Checks
+
+# --------------------------------------------------------------------------
+# Personal-project version of the work PMD_CHECKS.yml.
+# - No self-hosted runner, no container/registry, no custom PMD rules.
+# - Uses ubuntu-latest + PMD's built-in Apex rulesets.
+# --------------------------------------------------------------------------
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+    paths:
+      - "force-app/**"
+
+jobs:
+  pmd-analysis:
+    name: PMD Static Code Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed Apex files
+        id: changed-files
+        run: |
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" "$HEAD_SHA")
+          echo "Base SHA (merge-base): $BASE_SHA"
+          CHANGED=$(git diff --name-only --diff-filter=ACM "$BASE_SHA" "$HEAD_SHA" \
+            | grep -E '\.(cls|trigger)$' || true)
+          if [ -z "$CHANGED" ]; then
+            echo "no_apex=true" >> "$GITHUB_OUTPUT"
+            echo "No Apex files changed, skipping PMD"
+          else
+            echo "no_apex=false" >> "$GITHUB_OUTPUT"
+            echo "$CHANGED" > /tmp/changed_apex.txt
+            echo "Changed Apex files:"
+            cat /tmp/changed_apex.txt
+          fi
+
+      - name: Download PMD
+        if: steps.changed-files.outputs.no_apex == 'false'
+        run: |
+          PMD_VERSION="7.1.0"
+          curl -sSL "https://github.com/pmd/pmd/releases/download/pmd_releases%2F${PMD_VERSION}/pmd-dist-${PMD_VERSION}-bin.zip" -o pmd.zip
+          unzip -q pmd.zip
+          echo "PMD_HOME=$(pwd)/pmd-bin-${PMD_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Run PMD
+        id: pmd
+        if: steps.changed-files.outputs.no_apex == 'false'
+        run: |
+          set +e
+          "$PMD_HOME/bin/pmd" check \
+            --file-list /tmp/changed_apex.txt \
+            --rulesets category/apex/bestpractices.xml,category/apex/security.xml,category/apex/errorprone.xml \
+            --format sarif \
+            --report-file pmd-report.sarif \
+            --minimum-priority 3 \
+            --no-progress
+          PMD_SARIF_EXIT=$?
+
+          # Always write CSV too, for the PR comment / artifact
+          "$PMD_HOME/bin/pmd" check \
+            --file-list /tmp/changed_apex.txt \
+            --rulesets category/apex/bestpractices.xml,category/apex/security.xml,category/apex/errorprone.xml \
+            --format csv \
+            --report-file pmd-report.csv \
+            --minimum-priority 3 \
+            --no-progress
+          set -e
+
+          # PMD writes an empty/partial SARIF on some error paths — guard against that
+          if [ ! -s pmd-report.sarif ]; then
+            echo '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"PMD","rules":[]}},"results":[]}]}' > pmd-report.sarif
+          fi
+
+          # PMD exit code 4 = violations found - informational only for now, don't fail the job.
+          # Any other non-zero code means PMD itself hit a real error (bad config, crash, etc).
+          if [ "$PMD_SARIF_EXIT" -eq 4 ]; then
+            echo "::warning::PMD found violations. Review the report and PR comment (informational only - not blocking)."
+          elif [ "$PMD_SARIF_EXIT" -ne 0 ]; then
+            echo "::error::PMD exited with unexpected code $PMD_SARIF_EXIT."
+            exit 1
+          fi
+
+      - name: Upload SARIF
+        if: always() && steps.changed-files.outputs.no_apex == 'false'
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: pmd-report.sarif
+          category: pmd
+
+      - name: Upload PMD report artifact
+        if: always() && steps.changed-files.outputs.no_apex == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pmd-report
+          path: pmd-report.csv
+
+      - name: Post PMD results as PR comment
+        if: always() && steps.changed-files.outputs.no_apex == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const MARKER = '<!-- pmd-bot-comment -->';
+            const priorityLabel = { '1': '🔴 Critical', '2': '🔴 High', '3': '🟡 Medium', '4': '🔵 Low', '5': '⚪ Info' };
+
+            let body = `${MARKER}\n### PMD Static Code Analysis\n`;
+
+            if (!fs.existsSync('pmd-report.csv')) {
+              body += 'No report generated.';
+            } else {
+              const csvContent = fs.readFileSync('pmd-report.csv', 'utf8').trim();
+              const lines = csvContent.split('\n').filter(l => l.trim());
+              if (lines.length <= 1) {
+                body += '✅ No violations found.';
+              } else {
+                body += `⚠️ **${lines.length - 1}** violation(s) found.\n\n`;
+                body += `Full report is attached as the \`pmd-report\` workflow artifact.`;
+              }
+            }
+
+            // Remove previous bot comments, then post fresh one
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            for (const c of comments.data) {
+              if (c.body && c.body.includes(MARKER)) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: c.id,
+                });
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });

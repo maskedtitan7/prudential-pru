@@ -1,0 +1,203 @@
+name: Validate Feature to Track
+
+# --------------------------------------------------------------------------
+# Git/content quality gate: Feature branch -> Track branch.
+# Does: checkout, SGD delta, package.xml/destructiveChanges inspection,
+#       Apex/test-class checks, PMD, ESLint, artifacts.
+# Does NOT: authenticate to Salesforce or deploy/validate against an org.
+# That happens later in VALIDATE_PULL_REQUEST.yml (Track -> SIT/QA).
+#
+# NOTE: this triggers on PRs into a "track/**" branch. Create a track-style
+# branch first (similar to your feature/track-CRMCC-pacs practice branch)
+# for this to actually fire, or adjust the pattern below to match your
+# naming.
+# --------------------------------------------------------------------------
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - "track/**"
+    paths:
+      - "force-app/**"
+
+jobs:
+  validate-feature-to-track:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Display PR Info
+        run: |
+          echo "Source Branch: ${{ github.head_ref }}"
+          echo "Target Branch: ${{ github.base_ref }}"
+
+      - name: Checkout Salesforce Repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Install Salesforce CLI + sfdx-git-delta
+        run: |
+          npm install --global @salesforce/cli@latest
+          sf plugins install sfdx-git-delta
+
+      - name: Environment Sanity Check
+        run: |
+          sf --version
+          sf plugins
+          node -v
+
+      - name: Fix Git Safe Directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Fetch Target Branch
+        run: git fetch origin "${{ github.base_ref }}"
+
+      - name: Compute Merge Base
+        id: mergebase
+        run: |
+          MERGE_BASE=$(git merge-base HEAD "origin/${{ github.base_ref }}")
+          echo "merge_base=$MERGE_BASE" >> "$GITHUB_OUTPUT"
+          echo "Merge base: $MERGE_BASE"
+
+      # ----------------------------------------------------------------------
+      # SGD Delta
+      # ----------------------------------------------------------------------
+      - name: Generate Delta Package
+        run: |
+          mkdir force-app-delta
+          sf sgd source delta \
+            --to HEAD \
+            --from "${{ steps.mergebase.outputs.merge_base }}" \
+            --output-dir force-app-delta \
+            --source-dir force-app \
+            --api-version 66.0 \
+            --generate-delta
+
+      - name: Show Delta Structure
+        run: ls -R force-app-delta || echo "No delta generated"
+
+      - name: Print Generated package.xml
+        run: |
+          if [ -f force-app-delta/package/package.xml ]; then
+            echo "================ PACKAGE.XML ================"
+            cat force-app-delta/package/package.xml
+          else
+            echo "No package.xml generated"
+          fi
+
+      - name: Print Generated destructiveChanges.xml
+        run: |
+          if [ -f force-app-delta/destructiveChanges/destructiveChanges.xml ]; then
+            echo "========== DESTRUCTIVE CHANGES XML =========="
+            cat force-app-delta/destructiveChanges/destructiveChanges.xml
+          else
+            echo "No destructiveChanges.xml generated"
+          fi
+
+      # ----------------------------------------------------------------------
+      # Changed Apex files (for PMD + test-class check)
+      # ----------------------------------------------------------------------
+      - name: Get Changed Apex Files
+        id: changed-files
+        run: |
+          CHANGED=$(git diff --name-only --diff-filter=ACM "${{ steps.mergebase.outputs.merge_base }}" HEAD \
+            | grep -E '\.(cls|trigger)$' || true)
+          if [ -z "$CHANGED" ]; then
+            echo "no_apex=true" >> "$GITHUB_OUTPUT"
+            echo "No Apex files changed"
+          else
+            echo "no_apex=false" >> "$GITHUB_OUTPUT"
+            echo "$CHANGED" > /tmp/changed_apex.txt
+            echo "Changed Apex files:"
+            cat /tmp/changed_apex.txt
+          fi
+
+      - name: Check Test Classes Exist For Changed Classes
+        if: steps.changed-files.outputs.no_apex == 'false'
+        run: |
+          MISSING=()
+          while IFS= read -r cls; do
+            [ -z "$cls" ] && continue
+            base=$(basename "$cls" .cls)
+            [[ "$base" =~ ^[Tt]est ]] && continue
+            [[ "$base" =~ [Tt]ests?$ ]] && continue
+            FOUND=0
+            while IFS= read -r candidate; do
+              [ -z "$candidate" ] && continue
+              cbase=$(basename "$candidate" .cls)
+              if [[ "$cbase" =~ ^[Tt]est ]] || [[ "$cbase" =~ [Tt]ests?$ ]]; then
+                FOUND=1
+              fi
+            done < <(find force-app -type f -iname "*${base}*.cls")
+            if [ "$FOUND" -eq 0 ]; then
+              MISSING+=("$cls")
+            fi
+          done < /tmp/changed_apex.txt
+
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "::warning::The following changed classes/triggers have no obvious test class:"
+            for m in "${MISSING[@]}"; do echo "::warning::  - $m"; done
+          fi
+
+      # ----------------------------------------------------------------------
+      # PMD (built-in Apex rulesets - see PMD_CHECKS.yml notes on custom rules)
+      # ----------------------------------------------------------------------
+      - name: Download PMD
+        if: steps.changed-files.outputs.no_apex == 'false'
+        run: |
+          PMD_VERSION="7.1.0"
+          curl -sSL "https://github.com/pmd/pmd/releases/download/pmd_releases%2F${PMD_VERSION}/pmd-dist-${PMD_VERSION}-bin.zip" -o pmd.zip
+          unzip -q pmd.zip
+          echo "PMD_HOME=$(pwd)/pmd-bin-${PMD_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Run PMD on Delta
+        if: steps.changed-files.outputs.no_apex == 'false'
+        continue-on-error: true
+        run: |
+          "$PMD_HOME/bin/pmd" check \
+            --dir "./force-app-delta/force-app" \
+            --rulesets category/apex/bestpractices.xml,category/apex/security.xml,category/apex/errorprone.xml \
+            --format csv \
+            --report-file pmd-delta-report.csv \
+            --minimum-priority 3 \
+            --no-progress
+
+      - name: Upload PMD Delta Report
+        if: always() && steps.changed-files.outputs.no_apex == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PMD-Delta-Report
+          path: pmd-delta-report.csv
+          if-no-files-found: ignore
+
+      # ----------------------------------------------------------------------
+      # ESLint (LWC)
+      # ----------------------------------------------------------------------
+      - name: Run LWC ESLint Scan (Delta Only)
+        id: eslint
+        continue-on-error: true
+        run: |
+          if [ ! -d "force-app-delta/force-app" ]; then
+            echo "No delta folder found. Skipping ESLint scan."
+            exit 0
+          fi
+          npm install
+          npx eslint "./force-app-delta/force-app/**/*.js" \
+            --no-error-on-unmatched-pattern \
+            --format json \
+            --output-file eslint-report.json || true
+          echo "ESLint scan complete"
+
+      - name: Upload ESLint Report
+        if: always() && steps.changed-files.outputs.no_apex != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ESLint-Delta-Report
+          path: eslint-report.json
+          if-no-files-found: ignore

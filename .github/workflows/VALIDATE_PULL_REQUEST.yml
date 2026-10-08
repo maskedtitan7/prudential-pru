@@ -1,4 +1,4 @@
-name: Validate Pull Request (Track -> SIT/QA)
+name: Validate Pull Request
 
 # --------------------------------------------------------------------------
 # Personal-project version of the work VALIDATE_PULL_REQUEST.yml.

@@ -18,6 +18,7 @@ on:
     types: [opened, synchronize, reopened]
     branches:
       - "track/**"
+      - feature/track-module
     paths:
       - "force-app/**"
 

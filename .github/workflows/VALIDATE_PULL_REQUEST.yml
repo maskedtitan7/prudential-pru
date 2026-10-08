@@ -14,7 +14,6 @@ on:
     types: [opened, synchronize, reopened]
     branches:
       - sit
-      - feature/track-module
       - uat
     paths:
       - "force-app/**"

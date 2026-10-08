@@ -1,4 +1,5 @@
 public with sharing class TrainingCourseController {
+    // Test change to trigger PMD and test-class checks
     @AuraEnabled(cacheable=true)
     public static List<Training_Course__c> getCourses() {
         return [

@@ -1,0 +1,20 @@
+<template>
+    <lightning-card title="Training Courses" icon-name="standard:education">
+        <div class="slds-p-horizontal_medium">
+            <template if:true={hasCourses}>
+                <lightning-datatable
+                    key-field="Id"
+                    data={courses}
+                    columns={columns}
+                    hide-checkbox-column>
+                </lightning-datatable>
+            </template>
+            <template if:false={hasCourses}>
+                <p>No training courses found.</p>
+            </template>
+            <template if:true={error}>
+                <p class="slds-text-color_error">Could not load courses.</p>
+            </template>
+        </div>
+    </lightning-card>
+</template>

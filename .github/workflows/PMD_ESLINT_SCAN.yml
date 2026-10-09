@@ -160,7 +160,10 @@ jobs:
       - name: Fail Job If Violations Found
         if: always()
         run: |
-          if [ "${{ steps.pmd.outputs.outcome }}" = "failure" ] || [ "${{ steps.eslint.outputs.outcome }}" = "failure" ]; then
+          # Use the step's own outcome (set by GitHub even with continue-on-error).
+          # The old "outputs.outcome" was never written when PMD/ESLint failed,
+          # because the shell stopped before reaching the echo line.
+          if [ "${{ steps.pmd.outcome }}" = "failure" ] || [ "${{ steps.eslint.outcome }}" = "failure" ]; then
             echo "::error::Violations found by PMD and/or ESLint on branch ${{ matrix.branch }}. Check the uploaded CSV/JSON artifacts and job summary for details."
             exit 1
           fi

@@ -154,6 +154,8 @@ jobs:
       # ----------------------------------------------------------------------
       - name: Deploy Delta to Target Org
         run: |
+          # Fail this step if the deploy fails, even though output is piped to tee
+          set -o pipefail
           if [ ! -f force-app-delta/package/package.xml ]; then
             echo "No SF changes found. Deployment skipped."
             exit 0
@@ -180,7 +182,7 @@ jobs:
             node -e '
               const fs = require("fs");
               const xml = fs.readFileSync("force-app-delta/package/package.xml", "utf8");
-              const isTestName = n => /Test/i.test(n) || /Tests?$/i.test(n);
+              const isTestName = n => /^Test/i.test(n) || /Tests?$/i.test(n);
               const apexMembers = [];
               for (const block of xml.matchAll(/<types>([\s\S]*?)<\/types>/g)) {
                 const typeName = (block[1].match(/<name>([^<]+)<\/name>/) || [])[1];

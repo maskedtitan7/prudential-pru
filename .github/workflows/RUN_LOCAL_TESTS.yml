@@ -225,19 +225,30 @@ jobs:
             for (const t of tests) console.log(`${(t.ApexClass && t.ApexClass.Name) || ""} | ${t.MethodName || ""} | ${t.Outcome}`);
 
             const summaryFile = process.env.GITHUB_STEP_SUMMARY;
+            const s = result.summary || {};
+            const cell = v => String(v === undefined || v === null ? "" : v).replace(/\|/g, "\\|").replace(/\n/g, " ");
             if (summaryFile) {
               const md = [
                 `## Apex RunLocalTests - ${orgName} (${reportDate})`,
                 "",
                 `**Result:** ${outcome}`,
-                `**Tests Ran:** ${tests.length} | **Passing:** ${passing.length} | **Failing:** ${failing.length}`,
+                `**Tests Ran:** ${s.testsRan != null ? s.testsRan : tests.length} | **Passing:** ${s.passing != null ? s.passing : passing.length} | **Failing:** ${s.failing != null ? s.failing : failing.length}`,
+                `**Pass Rate:** ${s.passRate || "n/a"} | **Fail Rate:** ${s.failRate || "n/a"}`,
+                `**Org-Wide Coverage:** ${s.orgWideCoverage || "n/a"}`,
+                `**Test Run Coverage:** ${s.testRunCoverage || "n/a"}`,
+                "",
+                "### Test Results",
+                "",
+                "| Class | Method | Outcome | Message |",
+                "| --- | --- | --- | --- |",
               ];
-              if (failing.length > 0) {
-                md.push("", "| Class | Method | Message |", "| --- | --- | --- |");
-                for (const t of failing) {
-                  const msg = (t.Message || "").replace(/\|/g, "\\|").replace(/\n/g, " ");
-                  md.push(`| ${(t.ApexClass && t.ApexClass.Name) || ""} | ${t.MethodName || ""} | ${msg} |`);
-                }
+              for (const t of tests) {
+                md.push(`| ${cell(t.ApexClass && t.ApexClass.Name)} | ${cell(t.MethodName)} | ${cell(t.Outcome)} | ${cell(t.Message)} |`);
+              }
+              md.push("", "### Code Coverage by Class (lowest first)", "", "| Class | Covered | Total | Coverage % |", "| --- | --- | --- | --- |");
+              for (const c of coverageSorted) {
+                const pct = c.totalLines > 0 ? ((c.totalCovered / c.totalLines) * 100).toFixed(1) + "%" : "n/a";
+                md.push(`| ${cell(c.name)} | ${cell(c.totalCovered)} | ${cell(c.totalLines)} | ${pct} |`);
               }
               fs.appendFileSync(summaryFile, md.join("\n") + "\n\n");
             }

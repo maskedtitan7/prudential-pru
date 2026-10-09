@@ -1,3 +1,4 @@
+   // Included in UAT deployment so the helper has test coverage
 @isTest
 private class EmployeeTestHelperTest {
     @isTest
